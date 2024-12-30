@@ -6,6 +6,7 @@ import html
 import json
 import mimetypes
 import os
+import pdf2image
 import re
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import traceback
 import zipfile
+from io import BytesIO
 from xml.dom import minidom
 from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
@@ -22,8 +24,6 @@ from warnings import warn, resetwarnings, catch_warnings
 import mammoth
 import markdownify
 import pandas as pd
-import pdfminer
-import pdfminer.high_level
 import pptx
 
 # File-format detection
@@ -676,7 +676,7 @@ class BingSerpConverter(DocumentConverter):
 
 class PdfConverter(DocumentConverter):
     """
-    Converts PDFs to Markdown. Most style information is ignored, so the results are essentially plain-text.
+    Converts PDFs to Markdown. If llm_client and llm_model are provided, each page is treated as an image and described using the LLM.
     """
 
     def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
@@ -685,9 +685,76 @@ class PdfConverter(DocumentConverter):
         if extension.lower() != ".pdf":
             return None
 
+        # Default behavior
+        llm_client = kwargs.get("llm_client")
+        llm_model = kwargs.get("llm_model")
+        
+        if llm_client is None or llm_model is None:
+            from pdfminer.high_level import extract_text
+            return DocumentConverterResult(
+                title=None,
+                text_content=extract_text(local_path),
+            )
+
+        # Advanced behavior with LLM
+        pages = pdf2image.convert_from_path(local_path)
+        combined_md_content = ""
+
+        for page_index, page_image in enumerate(pages):
+            # Convert page image to Base64
+            with BytesIO() as buffer:
+                page_image.save(buffer, format="JPEG")
+                image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                content_type = "image/jpeg"
+                data_uri = f"data:{content_type};base64,{image_base64}"
+
+            # Generate description via LLM
+            prompt = kwargs.get("llm_prompt")
+            if not prompt:
+                prompt = '''
+                    Analyze the provided page of a document (in image format) and extract all visible text in the original language. Reproduce the extracted text in a structured Markdown format, meticulously preserving every detail of the formatting and style. This includes, but is not limited to:
+                    - Headings (with accurate levels).
+                    - Bullet points and numbered lists.
+                    - Bold, italic, strikethrough, and underline.
+                    - Highlights and text color changes (indicating the specific color used).
+                    - Superscripts, subscripts, and other typographical variations.
+
+                    **Special attention:**
+                    1. Formatting can apply to entire paragraphs, single words, or even individual letters. Ensure that all such details are accurately captured and represented in the Markdown output.
+                    2. Overlapping styles (e.g., bold and underline applied to the same text) must be annotated using Markdown syntax that reflects all styles. If Markdown syntax does not support certain combinations, describe the styling in detail under **"Visual Notes."**
+                    3. Precisely capture the structure and hierarchy of the original document, including any indentation, alignment, or spacing variations.
+
+                    Additionally:
+                    1. For any visual elements (e.g., diagrams, logos, charts, or specific layouts) that cannot be directly represented in Markdown, describe them in plain text under a section titled **"Visual Notes."** Be precise and descriptive.
+                    2. Explicitly mark areas where visual styling overlaps or interacts with the text (e.g., a bold, italicized word with a highlight).
+
+                    **Guidelines:**
+                    - Ensure even the smallest formatting details are reproduced (e.g., a single bolded letter in a word should be annotated correctly).
+                    - Include notes in **"Visual Notes"** for styling that cannot be represented in Markdown.
+                    - Output the text directly in Markdown format **without adding any code block delimiters (e.g., no ``` or ```markdown).** Ensure the output consists only of the plain Markdown text.
+
+                    Your goal is to produce a comprehensive and accurate Markdown representation of the document, including ALL stylistic and structural details, down to individual words and letters.
+                '''
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_uri},
+                        },
+                    ],
+                }
+            ]
+
+            response = llm_client.chat.completions.create(model=llm_model, messages=messages)
+            combined_md_content += f"\n# Page {page_index + 1}\n" + response.choices[0].message.content.strip() + "\n"
+
         return DocumentConverterResult(
             title=None,
-            text_content=pdfminer.high_level.extract_text(local_path),
+            text_content=combined_md_content,
         )
 
 
